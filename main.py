@@ -1,6 +1,7 @@
 import sys
 from llvm2py import parse_assembly
 from ortools.sat.python import cp_model
+import pandas as pd
 
 DOT = '''
 digraph G {
@@ -88,8 +89,9 @@ def placed_to_levels(placed):
     return levels
 
 
-def opt_schedule(dag):
-    levels = schedule(dag)
+def opt_schedule(dag, levels=None):
+    if levels is None:
+        levels = schedule(dag)
     depth = len(levels)
     model = cp_model.CpModel()
     max_width = model.NewIntVar(0, len(max(levels, key=len)), 'max_width')
@@ -114,6 +116,14 @@ def opt_schedule(dag):
 def dag_to_dot(dag, levels=None):
     dot = []
     nodes = {}
+    
+    # Формирование колонки со надписями Ярусов
+    if levels:
+        for i in range(1, len(levels)):
+            dot.append(f"tier_{i}")
+            dot.append(f'tier_{i} -> tier_{i + 1} [style="invis"]')
+        dot.append(f"tier_{len(levels)}")
+    
     for i, (ret, (op, *_)) in enumerate(dag.items()):
         nodes[ret] = i
         shape = ' fillcolor=none shape=none' if op in INPUT_OPS else ''
@@ -126,9 +136,15 @@ def dag_to_dot(dag, levels=None):
     if levels:
         args = [n for n, (op, *_) in dag.items() if op in INPUT_OPS]
         levels = [args] + levels
-        for level in levels:
+        
+        # Ярус с аргументами
+        level = levels[0]
+        level = '; '.join([f'n{nodes[n]}' for n in level])
+        dot.append(f'{{rank=same; {level}}}')
+
+        for i, level in enumerate(levels[1:], start=1):
             level = '; '.join([f'n{nodes[n]}' for n in level])
-            dot.append(f'{{rank=same; {level}}}')
+            dot.append(f'{{rank=same; {level}; tier_{i}[label="Ярус {i}" fillcolor=none shape=none]}}')
     return DOT % ('\n'.join(dot))
 
 
@@ -141,29 +157,67 @@ def has_no_calls(block):
     return True
 
 
-with open(sys.argv[1]) as file:
-    mod = parse_assembly(file.read())
+def calc(program_name, df):
+    with open(program_name) as file:
+        ll = file.read()
+    
+    mod = parse_assembly(ll)
+    dags = {}
+    for func in mod.functions:
+        for block in func.blocks:
+            if has_no_calls(block):
+                dags[f'{func.name}.{block.name}'] = make_dag(block)
 
-dags = {}
 
-for func in mod.functions:
-    for block in func.blocks:
-        if has_no_calls(block):
-            dags[f'{func.name}.{block.name}'] = make_dag(block)
+    for name, dag in dags.items():
+        no_ins_dag = remove_ops(dag, INPUT_OPS)
+        size = len(no_ins_dag)
+        if size:
+            
+            filename0 = f"dags/{program_name}_{name}_{size}_0.dot"
+            filename1 = f"dags/{program_name}_{name}_{size}_1.dot"
+            filename2 = f"dags/{program_name}_{name}_{size}_2.dot"
+            with open(filename0, 'w') as file:
+                file.write(dag_to_dot(dag))
+            
+            easy_levels = schedule(no_ins_dag)
+            
+            with open(filename1, 'w') as file:
+                file.write(dag_to_dot(dag, easy_levels))
+            
+            levels = opt_schedule(no_ins_dag, easy_levels)
+            
+            with open(filename2, 'w') as file:
+                file.write(dag_to_dot(dag, levels))
+            
+            acc = round(size / len(levels), 2)
+            df.loc[len(df)] = [
+                program_name, *name.split('.'),
+                size, len(max(easy_levels, key=len)), acc,
+                len(max(levels, key=len)), len(levels) - 1,
+                filename0, filename1, filename2
+            ]
+            
+    return df
 
-stat = []
+# for acc, name, dag, size, levels in sorted(stat,
+#                                            key=lambda x: x[0], reverse=True)[:10]:
+#     max_width = len(max(levels, key=len))
+#     print(f'# {name} size={size} acc={acc:.2f} max_width={max_width:.2f}')
+#     with open(f"dags/{name}.dot", "w") as file:
+#         file.write(dag_to_dot(dag, levels))
 
-for name, dag in dags.items():
-    no_ins_dag = remove_ops(dag, INPUT_OPS)
-    size = len(no_ins_dag)
-    if size:
-        levels = opt_schedule(no_ins_dag)
-        acc = size / len(levels)
-        stat.append((acc, name, dag, size, levels))
+df = pd.DataFrame(columns=[
+            'Программа', 'Функция', 'Блок',
+            'Количество инструкций', 'Максимальная ширина', 'Ускорение',
+            'Оптимизированная ширина',
+            'Глубина вычислений',
+            'Путь к графу зависимостей',
+            'Путь к ярусно-параллельной форме',
+            'Путь к оптимизированной ярусно-параллельной форме',
+        ])
 
-for acc, name, dag, size, levels in sorted(stat,
-                                           key=lambda x: x[0], reverse=True)[:10]:
-    max_width = len(max(levels, key=len))
-    print(f'# {name} size={size} acc={acc:.2f} max_width={max_width:.2f}')
-    with open(f"dags/{name}.dot", "w") as file:
-        file.write(dag_to_dot(dag, levels))
+df = calc('nanojpeg.ll', df)
+df = calc('aesopt.ll', df)
+df = calc('chacha20.ll', df)
+df.to_csv('data.csv')
